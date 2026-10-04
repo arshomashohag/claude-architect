@@ -113,7 +113,7 @@ function renderOverview() {
     <p class="sect-sub">Work through it in this order; each step builds on the one before.</p>
     <div class="grid3">
       <div class="sheet sheet-pad"><p class="eyebrow">Step 1</p><h3 class="h3">Read the sheet</h3><p class="muted" style="margin:0;font-size:14.5px">Each task statement from the exam guide, condensed to what's tested, plus the trap answer that catches people who know it only roughly.</p></div>
-      <div class="sheet sheet-pad"><p class="eyebrow">Step 2</p><h3 class="h3">Work the labs</h3><p class="muted" style="margin:0;font-size:14.5px">${LABS.filter(l => l.type === "code").length} code labs with unit tests, plus bug hunts, config builders, schema and payload authoring with live validators, triage drills, sequencing, and a calibration simulator.</p></div>
+      <div class="sheet sheet-pad"><p class="eyebrow">Step 2</p><h3 class="h3">Work the labs</h3><p class="muted" style="margin:0;font-size:14.5px">${LABS.filter(l => l.type === "code").length} Python labs with pytest-style tests (run in the page or locally), plus bug hunts, config builders, schema and payload authoring with live validators, triage drills, sequencing, and a calibration simulator.</p></div>
       <div class="sheet sheet-pad"><p class="eyebrow">Step 3</p><h3 class="h3">Sit the mock</h3><p class="muted" style="margin:0;font-size:14.5px">Four random scenarios, 15 items each, 120 minutes, one best answer per item. Results break out by domain and scenario and link back to the labs for what you missed.</p></div>
     </div>
   </div>
@@ -347,14 +347,18 @@ function labOrder(lab, host) {
 }
 
 /* editor (author & validate) */
-function editorKeys(ta) {
+function editorKeys(ta, unit) {
+  unit = unit || "  ";
+  const put = text => { ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, "end"); ta.dispatchEvent(new Event("input")); };
   ta.addEventListener("keydown", e => {
-    if (e.key === "Tab" && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
-      e.preventDefault();
-      const s = ta.selectionStart, en = ta.selectionEnd;
-      ta.value = ta.value.slice(0, s) + "  " + ta.value.slice(en);
-      ta.selectionStart = ta.selectionEnd = s + 2;
-      ta.dispatchEvent(new Event("input"));
+    if (e.altKey || e.metaKey || e.ctrlKey) return;
+    if (e.key === "Tab" && !e.shiftKey) { e.preventDefault(); put(unit); }
+    else if (e.key === "Enter" && unit.length === 4) {
+      // Python: keep the current indent, and indent one level after a line ending in ':'
+      const before = ta.value.slice(0, ta.selectionStart), line = before.slice(before.lastIndexOf("\n") + 1);
+      let ind = (line.match(/^[ \t]*/) || [""])[0];
+      if (/:\s*(#.*)?$/.test(line)) ind += unit;
+      e.preventDefault(); put("\n" + ind);
     }
   });
 }
@@ -528,76 +532,207 @@ function globToRe(g) {
   return new RegExp("^" + re + "$");
 }
 
-/* code (unit-tested) */
-const PRELUDE = "var __R=[];function check(name,fn){try{var r=fn();__R.push({name:name,pass:r===true,detail:r===true?'':(typeof r==='string'?r:'Returned '+JSON.stringify(r))});}catch(e){__R.push({name:name,pass:false,detail:'Threw: '+(e&&e.message?e.message:String(e))});}}\n";
-const WORKER_SRC = "self.onmessage=function(e){var out;try{out=(new Function(e.data))();}catch(err){out={fatal:(err&&err.name?err.name+': ':'')+(err&&err.message?err.message:String(err))};}try{self.postMessage(out);}catch(x){self.postMessage({fatal:'Results could not be returned: '+x.message});}};";
-let workerURL = null;
-function buildSource(lab, code) {
-  return PRELUDE + code + "\n;\nif (typeof " + lab.fn + " !== 'function') { return [{name:'Defines " + lab.fn + "()', pass:false, detail:'No function named " + lab.fn + " was found.'}]; }\n(" + lab.harness.toString() + ")();\nreturn __R;";
-}
-function runInline(src) {
-  try { return (new Function(src))(); }
-  catch (err) { return { fatal: (err && err.name ? err.name + ": " : "") + (err && err.message ? err.message : String(err)) }; }
-}
-function runCode(src, ms) {
-  return new Promise(resolve => {
+/* code (Python labs, run with Brython in a sandboxed worker) */
+const BRYTHON = window.__BRYTHON_BASE || "https://cdn.jsdelivr.net/npm/brython@3.14.3/";
+const PY_WORKER = [
+  "try{var L=self.navigator.language;new Intl.DateTimeFormat(L);}catch(x){try{Object.defineProperty(self.navigator,'language',{value:'en-US'});}catch(y){}}",
+  "self.onmessage=function(e){var m=e.data;",
+  " if(m.base){try{importScripts(m.base+'brython.min.js',m.base+'brython_stdlib.js');",
+  "  __BRYTHON__.runPythonSource('import json, sys, types, io, copy, re, traceback\\nfrom datetime import datetime, timezone');",
+  "  self.postMessage({ready:true});}catch(err){self.postMessage({loadError:String(err&&err.message||err)});}return;}",
+  " self.__RESULT__=null;",
+  " try{__BRYTHON__.runPythonSource(m.src);}catch(err){}",
+  " self.postMessage({id:m.id,result:self.__RESULT__});",
+  "};"].join("\n");
+let pyW = null, pyReady = null, pySeq = 0, pyState = "idle";
+function pyWorker() {
+  if (pyReady) return pyReady;
+  pyState = "loading";
+  pyReady = new Promise((resolve, reject) => {
     let w;
-    try {
-      if (!workerURL) workerURL = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
-      w = new Worker(workerURL);
-    } catch (e) { resolve(runInline(src)); return; }
-    let settled = false;
-    const finish = v => { if (settled) return; settled = true; clearTimeout(t); try { w.terminate(); } catch (e) { /* ignore */ } resolve(v); };
-    const t = setTimeout(() => finish({ fatal: "Timed out after " + ms / 1000 + " seconds. Is there a loop that never ends?" }), ms);
-    w.onmessage = e => finish(e.data);
-    w.onerror = e => { if (e && e.preventDefault) e.preventDefault(); finish(runInline(src)); };
-    w.postMessage(src);
+    try { w = new Worker(URL.createObjectURL(new Blob([PY_WORKER], { type: "text/javascript" }))); }
+    catch (e) { reject(new Error("The browser refused to start a worker: " + e.message)); return; }
+    const t = setTimeout(() => { w.terminate(); reject(new Error("Timed out loading the Python runtime.")); }, 90000);
+    w.onmessage = e => {
+      clearTimeout(t);
+      if (e.data && e.data.ready) { pyW = w; resolve(w); }
+      else { w.terminate(); reject(new Error((e.data && e.data.loadError) || "The Python runtime failed to load.")); }
+    };
+    w.onerror = e => { clearTimeout(t); if (e.preventDefault) e.preventDefault(); w.terminate(); reject(new Error(e.message || "The worker could not start.")); };
+    w.postMessage({ base: BRYTHON });
+  });
+  pyReady.then(() => { pyState = "ready"; refreshPyStatus(); }, () => { pyState = "failed"; pyReady = null; refreshPyStatus(); });
+  return pyReady;
+}
+function resetPy() { if (pyW) { try { pyW.terminate(); } catch (e) { /* ignore */ } } pyW = null; pyReady = null; pyState = "idle"; }
+async function runPython(src, ms) {
+  let w;
+  try { w = await pyWorker(); } catch (e) { return { loadError: e.message }; }
+  const id = ++pySeq;
+  return new Promise(resolve => {
+    const t = setTimeout(() => { resetPy(); resolve({ fatal: "Timed out after " + ms / 1000 + " seconds. Is there a loop that never ends?" }); }, ms);
+    w.onmessage = e => {
+      if (!e.data || e.data.id !== id) return;
+      clearTimeout(t);
+      try { resolve(JSON.parse(e.data.result)); } catch (x) { resolve({ fatal: "The Python runner stopped before reporting results." }); }
+    };
+    w.onerror = e => { clearTimeout(t); if (e.preventDefault) e.preventDefault(); resetPy(); resolve({ fatal: e.message || "The worker crashed." }); };
+    w.postMessage({ id, src });
   });
 }
+function pyProgram(lab, code, tests) {
+  const J = JSON.stringify;
+  return [
+    "import sys, types, json, io, traceback",
+    "from browser import self as _scope",
+    "_MOD = " + J(lab.py),
+    "_USER = " + J(code),
+    "_TESTS = " + J(tests),
+    "_out = io.StringIO()",
+    "_results = []",
+    "if not getattr(json, '_lab_patched', False):",  // Brython raises its own JSONError; match CPython's ValueError subclass
+    "    class JSONDecodeError(ValueError):",
+    "        pass",
+    "    _loads = json.loads",
+    "    def _patched_loads(s, *a, **k):",
+    "        try:",
+    "            return _loads(s, *a, **k)",
+    "        except ValueError:",
+    "            raise",
+    "        except Exception as e:",
+    "            raise JSONDecodeError(str(e))",
+    "    json.loads = _patched_loads",
+    "    json.JSONDecodeError = JSONDecodeError",
+    "    json._lab_patched = True",
+    "def _where(exc):",
+    "    try:",
+    "        for fr in reversed(traceback.extract_tb(exc.__traceback__)):",
+    "            if fr.filename == _MOD + '.py':",
+    "                return ' (' + _MOD + '.py, line ' + str(fr.lineno) + ')'",
+    "    except Exception:",
+    "        pass",
+    "    return ''",
+    "_old = sys.stdout",
+    "sys.stdout = _out",
+    "try:",
+    "    _mod = types.ModuleType(_MOD)",
+    "    _mod.__file__ = _MOD + '.py'",
+    "    try:",
+    "        exec(compile(_USER, _MOD + '.py', 'exec'), _mod.__dict__)",
+    "    except SyntaxError as e:",
+    "        _results.append({'name': 'Your code compiles', 'pass': False, 'detail': 'SyntaxError: ' + str(e.msg) + ' (line ' + str(e.lineno) + ')'})",
+    "    except Exception as e:",
+    "        _results.append({'name': 'Your module loads', 'pass': False, 'detail': type(e).__name__ + ': ' + str(e) + _where(e)})",
+    "    else:",
+    "        sys.modules[_MOD] = _mod",
+    "        _ns = {'__name__': 'test_' + _MOD}",
+    "        try:",
+    "            exec(compile(_TESTS, 'test_' + _MOD + '.py', 'exec'), _ns)",
+    "        except Exception as e:",
+    "            _results.append({'name': 'The tests can import your code', 'pass': False, 'detail': type(e).__name__ + ': ' + str(e)})",
+    "        else:",
+    "            for _name, _fn in list(_ns.items()):",
+    "                if not (_name.startswith('test_') and callable(_fn)):",
+    "                    continue",
+    "                _doc = ((_fn.__doc__ or _name).strip().splitlines() or [_name])[0]",
+    "                try:",
+    "                    _fn()",
+    "                    _results.append({'name': _doc, 'pass': True, 'detail': ''})",
+    "                except AssertionError as e:",
+    "                    _results.append({'name': _doc, 'pass': False, 'detail': str(e) or 'Assertion failed'})",
+    "                except Exception as e:",
+    "                    _results.append({'name': _doc, 'pass': False, 'detail': 'Raised ' + type(e).__name__ + ': ' + str(e) + _where(e)})",
+    "finally:",
+    "    sys.stdout = _old",
+    "    sys.modules.pop(_MOD, None)",
+    "_scope.__RESULT__ = json.dumps({'tests': _results, 'stdout': _out.getvalue()[-4000:]})"
+  ].join("\n");
+}
+const FILES = {};
+function labFiles(lab) {
+  if (!FILES[lab.py]) {
+    const get = p => fetch(p).then(r => { if (!r.ok) throw new Error(p + " (HTTP " + r.status + ")"); return r.text(); });
+    FILES[lab.py] = Promise.all([get("labs/" + lab.py + ".py"), get("labs/solutions/" + lab.py + ".py"), get("labs/tests/test_" + lab.py + ".py")])
+      .then(([starter, solution, tests]) => ({ starter, solution, tests }));
+    FILES[lab.py].catch(() => { delete FILES[lab.py]; });
+  }
+  return FILES[lab.py];
+}
+function refreshPyStatus() {
+  const el = document.getElementById("pystatus"); if (!el) return;
+  el.textContent = { idle: "Python runtime loads on first run", loading: "Loading the Python runtime (about 6 MB, first time only)…", ready: "Python runtime ready", failed: "Python runtime unavailable here" }[pyState];
+}
+const localHint = lab => `<details class="spec" style="margin-top:14px"><summary style="cursor:pointer"><b>Run it locally with pytest</b></summary>
+  <p style="margin:8px 0 6px">The same files are in the repository under <code>architect-foundations/labs/</code>. Edit <code>${esc(lab.py)}.py</code>, then from that folder:</p>
+  <div class="code"><pre>pip install pytest
+pytest tests/test_${esc(lab.py)}.py
+LAB_TARGET=solutions pytest tests/test_${esc(lab.py)}.py   # check the reference solution</pre></div></details>`;
 function labCode(lab, host) {
-  const st = LS[lab.id] || (LS[lab.id] = { code: lab.starter, res: null, sol: false, busy: false });
-  const lines = Math.max(st.code.split("\n").length, lab.starter.split("\n").length) + 2;
+  const st = LS[lab.id] || (LS[lab.id] = { code: null, files: null, res: null, sol: false, tests: false, busy: false, err: null });
+  if (!st.files) {
+    host.innerHTML = st.err
+      ? `<div class="result bad">Couldn't load the lab files: ${esc(st.err)}</div>${localHint(lab)}`
+      : `<p class="muted">Loading the lab files…</p>`;
+    if (!st.err) labFiles(lab).then(f => { st.files = f; if (st.code === null) st.code = f.starter; },
+                                   e => { st.err = e.message; })
+      .then(() => { if (document.getElementById("ex") === host) labCode(lab, host); });
+    return;
+  }
+  if (pyState === "idle") pyWorker().catch(() => {});
+  const lines = Math.max(st.code.split("\n").length, st.files.starter.split("\n").length) + 2;
   host.innerHTML = `
-    <label class="sr" for="code-${lab.id}">Code editor</label>
-    <textarea class="editor" id="code-${lab.id}" spellcheck="false" autocapitalize="off" autocomplete="off" style="min-height:${Math.min(640, 40 + lines * 21)}px">${esc(st.code)}</textarea>
+    <div class="row" style="margin-bottom:8px"><span class="chip blue">Python</span><span class="mono muted" style="font-size:12.5px">${esc(lab.py)}.py</span><span class="spacer"></span><span class="muted" id="pystatus" style="font-size:12.5px"></span></div>
+    <label class="sr" for="code-${lab.id}">Python editor</label>
+    <textarea class="editor" id="code-${lab.id}" spellcheck="false" autocapitalize="off" autocomplete="off" style="min-height:${Math.min(680, 40 + lines * 21)}px">${esc(st.code)}</textarea>
     <div class="row" style="margin-top:10px">
       <button type="button" class="btn primary" id="run" ${st.busy ? "disabled" : ""}>${st.busy ? "Running…" : "Run tests"}</button>
       <button type="button" class="btn" id="reset">Reset to starter</button>
+      <button type="button" class="linkbtn" id="showtests">${st.tests ? "Hide" : "Show"} the tests</button>
       <button type="button" class="linkbtn" id="sol">${st.sol ? "Hide" : "Show"} reference solution</button>
-      <span class="muted" style="font-size:13px">JavaScript · runs in a sandboxed worker in your browser</span>
     </div>
     <div id="out" style="margin-top:14px"></div>
-    ${st.sol ? `<div style="margin-top:14px"><div class="code"><pre>${esc(lab.solution)}</pre></div>
-      <button type="button" class="btn sm" id="loadsol" style="margin-top:8px">Load into editor</button></div>` : ""}`;
+    ${st.tests ? `<p class="mono muted" style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin:16px 0 4px">tests/test_${esc(lab.py)}.py</p><div class="code"><pre>${esc(st.files.tests)}</pre></div>` : ""}
+    ${st.sol ? `<p class="mono muted" style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin:16px 0 4px">solutions/${esc(lab.py)}.py</p><div class="code"><pre>${esc(st.files.solution)}</pre></div>
+      <button type="button" class="btn sm" id="loadsol" style="margin-top:8px">Load into editor</button>` : ""}
+    ${localHint(lab)}`;
+  refreshPyStatus();
   const ta = host.querySelector("textarea");
-  editorKeys(ta);
+  editorKeys(ta, "    ");
   ta.addEventListener("input", () => { st.code = ta.value; });
-  if (st.res) drawTests(host, st.res);
-  host.querySelector("#reset").addEventListener("click", () => { st.code = lab.starter; st.res = null; labCode(lab, host); });
+  if (st.res) drawTests(host, st.res, st.files.tests);
+  host.querySelector("#reset").addEventListener("click", () => { st.code = st.files.starter; st.res = null; labCode(lab, host); });
   host.querySelector("#sol").addEventListener("click", () => { st.sol = !st.sol; labCode(lab, host); });
+  host.querySelector("#showtests").addEventListener("click", () => { st.tests = !st.tests; labCode(lab, host); });
   const ls = host.querySelector("#loadsol");
-  if (ls) ls.addEventListener("click", () => { st.code = lab.solution; st.res = null; st.sol = false; labCode(lab, host); });
+  if (ls) ls.addEventListener("click", () => { st.code = st.files.solution; st.res = null; st.sol = false; labCode(lab, host); });
   host.querySelector("#run").addEventListener("click", async () => {
     st.busy = true; labCode(lab, host);
-    const res = await runCode(buildSource(lab, st.code), 4000);
+    const res = await runPython(pyProgram(lab, st.code, st.files.tests), 15000);
     st.busy = false; st.res = res;
     if (document.getElementById("ex") === host) labCode(lab, host);
-    if (Array.isArray(res) && res.length && res.every(r => r.pass)) pass(lab);
+    if (res && Array.isArray(res.tests) && res.tests.length && res.tests.every(r => r.pass)) pass(lab);
   });
 }
-function drawTests(host, res) {
+function testTitles(src) {
+  const titles = {}, re = /def (test_\w+)\([^)]*\):[ \t]*\n[ \t]+(?:"""|''')([^\n]*?)(?:"""|'''|\n)/g;
+  let m; while ((m = re.exec(src))) titles[m[1]] = m[2].trim();
+  return titles;
+}
+function drawTests(host, res, testsSrc) {
   const out = host.querySelector("#out"); if (!out) return;
-  if (!Array.isArray(res)) {
-    const msg = String(res && res.fatal || "Unknown error");
-    const blocked = /unsafe-eval|EvalError|Content Security Policy|call to Function\(\)/i.test(msg);
-    out.innerHTML = blocked
-      ? `<div class="result bad">This viewer doesn't allow the page to run code, so the tests can't execute here. Compare your code with the reference solution and the requirements above, or open the course file locally from the repository.</div>`
-      : `<div class="result bad"><b>Your code didn't run.</b> <span class="mono" style="font-size:13px">${esc(msg)}</span></div>`;
+  if (res.loadError) {
+    out.innerHTML = `<div class="result bad"><b>The Python runtime couldn't load in this viewer.</b> It comes from cdn.jsdelivr.net and needs permission to run code in the page. Use the pytest instructions below to run this lab on your machine. <span class="mono" style="font-size:12.5px">(${esc(res.loadError)})</span></div>`;
     return;
   }
-  const ok = res.filter(r => r.pass).length;
-  out.innerHTML = `<div class="result ${ok === res.length ? "ok" : "bad"}" style="margin-bottom:8px">${ok} of ${res.length} tests pass.</div>
-    <div class="tests">${res.map(r => `<div class="test ${r.pass ? "ok" : "no"}"><span class="m">${r.pass ? "✓" : "✗"}</span><span>${esc(r.name)}${r.detail ? `<br><span class="dt">${esc(r.detail)}</span>` : ""}</span></div>`).join("")}</div>`;
+  if (!Array.isArray(res.tests)) {
+    out.innerHTML = `<div class="result bad"><b>Your code didn't finish.</b> <span class="mono" style="font-size:13px">${esc(res.fatal || "Unknown error")}</span></div>`;
+    return;
+  }
+  const ok = res.tests.filter(r => r.pass).length, n = res.tests.length, titles = testTitles(testsSrc || "");
+  res.tests.forEach(r => { if (titles[r.name]) r.name = titles[r.name]; });
+  out.innerHTML = `<div class="result ${ok === n ? "ok" : "bad"}" style="margin-bottom:8px">${ok} of ${n} tests pass.</div>
+    <div class="tests">${res.tests.map(r => `<div class="test ${r.pass ? "ok" : "no"}"><span class="m">${r.pass ? "✓" : "✗"}</span><span>${esc(r.name)}${r.detail ? `<br><span class="dt">${esc(r.detail)}</span>` : ""}</span></div>`).join("")}</div>
+    ${res.stdout ? `<p class="mono muted" style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin:14px 0 4px">Printed output</p><div class="code"><pre>${esc(res.stdout)}</pre></div>` : ""}`;
 }
 
 /* sim: calibration */
