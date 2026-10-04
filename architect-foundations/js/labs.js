@@ -1,7 +1,7 @@
 /* CCA-F Architect Lab: domain briefings and hands-on labs.
    Prose strings may use `backticks` for inline code and **double asterisks** for bold.
-   Code labs: `harness` is serialized with Function.prototype.toString and run in a worker
-   after the learner's code, so it must be self-contained and only use `check(name, fn)`. */
+   Code labs are Python: `py` names the module in labs/ (starter), labs/solutions/ (reference)
+   and labs/tests/test_<py>.py (pytest-style tests). The page runs the same files. */
 
 window.COURSE_DOMAINS = [
 { id: 1, name: "Agentic Architecture & Orchestration", short: "Agentic Architecture", tab: "Agentic", weight: 27,
@@ -173,144 +173,14 @@ window.COURSE_DOMAINS = [
 window.COURSE_LABS = [
 /* =========================== DOMAIN 1 =========================== */
 { id: "1-1", d: 1, ts: "1.1", type: "code", mins: 20, title: "Fix the agent loop",
-  summary: "Repair a support agent's loop against a scripted mock model. Six tests.",
+  summary: "Repair a support agent's loop in Python against a scripted mock model. Six tests.",
   brief: ["This loop shipped last sprint. In production it stops halfway through investigations, forgets which tool it called, and crashes when the warehouse API times out.",
-          "Rewrite `runAgent` so all six tests pass. The mock `client.create()` is synchronous to keep the exercise on control flow; the real SDK call is async."],
-  spec: ["`client.create({ messages })` returns `{ stop_reason, content }`, where `content` holds `text` and `tool_use` blocks (`{ type, id, name, input }`).",
-         "`tools[name](input)` runs a tool and may throw.",
-         "Return the final `messages` array."],
-  fn: "runAgent",
-  starter: [
-"function runAgent(client, tools, userText) {",
-"  const messages = [{ role: \"user\", content: userText }];",
-"",
-"  for (let i = 0; i < 3; i++) {",
-"    const res = client.create({ messages });",
-"",
-"    const text = res.content.filter(b => b.type === \"text\").map(b => b.text).join(\"\");",
-"    if (text.includes(\"DONE\")) break;",
-"",
-"    for (const block of res.content) {",
-"      if (block.type !== \"tool_use\") continue;",
-"      const out = tools[block.name](block.input);",
-"      messages.push({",
-"        role: \"user\",",
-"        content: [{ type: \"tool_result\", tool_use_id: block.id, content: JSON.stringify(out) }]",
-"      });",
-"    }",
-"  }",
-"  return messages;",
-"}"].join("\n"),
-  solution: [
-"function runAgent(client, tools, userText) {",
-"  const messages = [{ role: \"user\", content: userText }];",
-"  const MAX_TURNS = 20; // backstop for runaway loops, not the stop rule",
-"",
-"  for (let turn = 0; turn < MAX_TURNS; turn++) {",
-"    const res = client.create({ messages });",
-"    messages.push({ role: \"assistant\", content: res.content });",
-"",
-"    if (res.stop_reason !== \"tool_use\") return messages; // end_turn (or another stop)",
-"",
-"    const results = [];",
-"    for (const block of res.content) {",
-"      if (block.type !== \"tool_use\") continue;",
-"      try {",
-"        const out = tools[block.name](block.input);",
-"        results.push({ type: \"tool_result\", tool_use_id: block.id, content: JSON.stringify(out) });",
-"      } catch (err) {",
-"        results.push({ type: \"tool_result\", tool_use_id: block.id,",
-"                       content: String(err && err.message || err), is_error: true });",
-"      }",
-"    }",
-"    messages.push({ role: \"user\", content: results }); // one message for the whole batch",
-"  }",
-"  throw new Error(\"Agent exceeded \" + MAX_TURNS + \" turns\");",
-"}"].join("\n"),
-  harness: function harness() {
-    function mk(script) {
-      var c = { calls: 0, seen: [] };
-      c.create = function (req) {
-        if (!req || !Array.isArray(req.messages)) throw new Error("client.create needs { messages: [...] }");
-        c.seen.push(JSON.parse(JSON.stringify(req.messages)));
-        c.calls++;
-        if (c.calls > 25) throw new Error("MOCK_BUDGET: the model was called more than 25 times");
-        var r = script(c.calls);
-        if (!r) throw new Error("MOCK_EXHAUSTED: the model was called again after it ended the turn");
-        return JSON.parse(JSON.stringify(r));
-      };
-      return c;
-    }
-    function tu(id, name, input) { return { type: "tool_use", id: id, name: name, input: input || {} }; }
-    function tx(t) { return { type: "text", text: t }; }
-    var tools = {
-      lookup_order: function (i) { return { order_id: i.order_id, status: "shipped" }; },
-      get_customer: function () { return { id: "C-1", verified: true }; }
-    };
-    check("Keeps going when the text says DONE but stop_reason is tool_use", function () {
-      var c = mk(function (n) {
-        if (n === 1) return { stop_reason: "tool_use", content: [tx("DONE with the greeting. Checking the order now."), tu("t1", "lookup_order", { order_id: "A1" })] };
-        if (n === 2) return { stop_reason: "end_turn", content: [tx("Your order shipped.")] };
-      });
-      runAgent(c, tools, "Where is order A1?");
-      return c.calls === 2 || ("The model was called " + c.calls + " time(s); expected 2.");
-    });
-    check("Appends the assistant turn before its tool results", function () {
-      var c = mk(function (n) {
-        if (n === 1) return { stop_reason: "tool_use", content: [tu("t1", "lookup_order", { order_id: "A1" })] };
-        if (n === 2) return { stop_reason: "end_turn", content: [tx("Shipped.")] };
-      });
-      runAgent(c, tools, "Where is order A1?");
-      var m = c.seen[1];
-      if (!m) return "The model was only called once.";
-      var a = m[m.length - 2], u = m[m.length - 1];
-      if (!a || a.role !== "assistant") return "The message before the tool results should be the assistant turn containing the tool_use block.";
-      var hasUse = Array.isArray(a.content) && a.content.some(function (b) { return b.type === "tool_use" && b.id === "t1"; });
-      if (!hasUse) return "The assistant turn should contain the original tool_use block (id t1).";
-      return (u && u.role === "user") || "The last message should be the user turn with tool results.";
-    });
-    check("Runs as many turns as the task needs and stops on end_turn", function () {
-      var c = mk(function (n) {
-        if (n <= 5) return { stop_reason: "tool_use", content: [tu("t" + n, "lookup_order", { order_id: "A" + n })] };
-        if (n === 6) return { stop_reason: "end_turn", content: [tx("All five orders checked.")] };
-      });
-      runAgent(c, tools, "Check orders A1 to A5");
-      return c.calls === 6 || ("Expected 6 model calls (5 tool turns + end_turn); got " + c.calls + ".");
-    });
-    check("Returns parallel tool results in ONE user message", function () {
-      var c = mk(function (n) {
-        if (n === 1) return { stop_reason: "tool_use", content: [tx("Checking both."), tu("t1", "get_customer", { email: "a@b.co" }), tu("t2", "lookup_order", { order_id: "A9" })] };
-        if (n === 2) return { stop_reason: "end_turn", content: [tx("Done.")] };
-      });
-      runAgent(c, tools, "Am I verified, and where is A9?");
-      var m = c.seen[1]; if (!m) return "The model was only called once.";
-      var last = m[m.length - 1];
-      var ids = Array.isArray(last.content) ? last.content.filter(function (b) { return b.type === "tool_result"; }).map(function (b) { return b.tool_use_id; }) : [];
-      return (last.role === "user" && ids.length === 2 && ids.indexOf("t1") >= 0 && ids.indexOf("t2") >= 0) ||
-        ("The last message held " + ids.length + " tool_result block(s). Put both results in a single user message.");
-    });
-    check("Reports a failing tool with is_error instead of crashing", function () {
-      var failing = { lookup_order: function () { throw new Error("warehouse timeout"); } };
-      var c = mk(function (n) {
-        if (n === 1) return { stop_reason: "tool_use", content: [tu("t1", "lookup_order", { order_id: "A1" })] };
-        if (n === 2) return { stop_reason: "end_turn", content: [tx("The warehouse system is slow; I'll retry shortly.")] };
-      });
-      runAgent(c, failing, "Where is A1?");
-      var m = c.seen[1]; if (!m) return "The model never saw the failure.";
-      var last = m[m.length - 1];
-      var r = Array.isArray(last.content) && last.content.filter(function (b) { return b.type === "tool_result" && b.tool_use_id === "t1"; })[0];
-      if (!r) return "No tool_result for t1 was sent back.";
-      return r.is_error === true || "The tool_result for the failed call should set is_error: true.";
-    });
-    check("Has its own backstop for runaway loops (stops within 20 calls)", function () {
-      var c = mk(function (n) { return { stop_reason: "tool_use", content: [tu("t" + n, "lookup_order", { order_id: "A1" })] }; });
-      try { runAgent(c, tools, "loop forever"); } catch (e) {
-        if (String(e && e.message).indexOf("MOCK_BUDGET") >= 0) return "The loop never stopped on its own.";
-      }
-      return c.calls <= 20 || ("The model was called " + c.calls + " times.");
-    });
-  },
-  takeaway: "Stop on `stop_reason`, never on prose. Append the assistant turn, answer every `tool_use` (failures with `is_error: true`) in one user message, and keep a turn cap only as a backstop." },
+          "Rewrite `run_agent` so all six tests pass. The mock client is synchronous and returns plain dicts to keep the exercise on control flow; the real SDK returns typed objects (`response.stop_reason`, `block.type`)."],
+  spec: ["`client.create(messages=[...])` returns `{\"stop_reason\": ..., \"content\": [...]}`, where `content` holds `text` and `tool_use` blocks (`{\"type\", \"id\", \"name\", \"input\"}`).",
+         "`tools[name](input)` runs a tool and may raise.",
+         "Return the final `messages` list."],
+  py: "agent_loop", fn: "run_agent",
+  takeaway: "Stop on `stop_reason`, never on prose. Append the assistant turn, answer every `tool_use` (failures with `is_error: True`) in one user message, and keep a turn cap only as a backstop." },
 
 { id: "1-2", d: 1, ts: "1.2 · 1.3", type: "defect", mins: 12, title: "Code review: the research coordinator",
   summary: "Four snippets from a multi-agent research system. Click the lines that cause the bug.",
@@ -373,156 +243,26 @@ window.COURSE_LABS = [
   takeaway: "The coordinator owns the graph: it holds the `Task` tool, fans out in one response, passes complete context explicitly, and is the only route between subagents." },
 
 { id: "1-3", d: 1, ts: "1.4 · 1.5", type: "code", mins: 15, title: "Write the refund gate",
-  summary: "Implement a pre-tool hook that enforces verification and the $500 limit in code.",
+  summary: "Implement a pre-tool hook in Python that enforces verification and the $500 limit in code.",
   brief: ["The support agent's prompt says \"verify the customer before refunding\" and \"refunds over $500 need a human\". Last month 3% of refunds skipped verification. Compliance wants a guarantee, so the rules move into a hook that runs before every tool call.",
-          "Implement `preToolUse`. Check the rules in the order listed."],
-  spec: ["Any tool other than `process_refund` → `{ decision: \"allow\" }`.",
-         "No verified customer yet (`session.verifiedCustomerId` is null) → deny. The reason should tell the agent to call `get_customer` first.",
-         "`input.customer_id` differs from the verified customer → deny.",
-         "`input.amount` is not a positive number → deny.",
-         "`input.amount` over 500 → `{ decision: \"redirect\", tool: \"escalate_to_human\", reason }`.",
+          "Implement `pre_tool_use`. Check the rules in the order listed."],
+  spec: ["Any tool other than `process_refund` → `{\"decision\": \"allow\"}`.",
+         "No verified customer yet (`session[\"verified_customer_id\"]` is `None`) → deny. The reason should tell the agent to call `get_customer` first.",
+         "`input[\"customer_id\"]` differs from the verified customer → deny.",
+         "`input[\"amount\"]` is not a positive number → deny.",
+         "`input[\"amount\"]` over 500 → `{\"decision\": \"redirect\", \"tool\": \"escalate_to_human\", \"reason\": ...}`.",
          "Otherwise allow. Every deny or redirect carries a non-empty `reason`."],
-  fn: "preToolUse",
-  starter: [
-"// call    = { tool: \"process_refund\", input: { customer_id: \"C-88\", order_id: \"A-1\", amount: 120 } }",
-"// session = { verifiedCustomerId: \"C-88\" }   // null until get_customer verifies someone",
-"//",
-"// Return { decision: \"allow\" }",
-"//     or { decision: \"deny\", reason: \"...\" }",
-"//     or { decision: \"redirect\", tool: \"escalate_to_human\", reason: \"...\" }",
-"function preToolUse(call, session) {",
-"  return { decision: \"allow\" };",
-"}"].join("\n"),
-  solution: [
-"function preToolUse(call, session) {",
-"  if (call.tool !== \"process_refund\") return { decision: \"allow\" };",
-"  const input = call.input || {};",
-"  if (!session.verifiedCustomerId) {",
-"    return { decision: \"deny\", reason: \"Customer not verified. Call get_customer first.\" };",
-"  }",
-"  if (input.customer_id !== session.verifiedCustomerId) {",
-"    return { decision: \"deny\", reason: \"Refund customer does not match the verified customer.\" };",
-"  }",
-"  if (typeof input.amount !== \"number\" || !(input.amount > 0)) {",
-"    return { decision: \"deny\", reason: \"Refund amount must be a positive number.\" };",
-"  }",
-"  if (input.amount > 500) {",
-"    return { decision: \"redirect\", tool: \"escalate_to_human\",",
-"             reason: \"Refunds over $500 need human approval.\" };",
-"  }",
-"  return { decision: \"allow\" };",
-"}"].join("\n"),
-  harness: function harness() {
-    function R(amount, cid) { return { tool: "process_refund", input: { customer_id: cid || "C-88", order_id: "A-1", amount: amount } }; }
-    function S(v) { return { verifiedCustomerId: v === undefined ? "C-88" : v }; }
-    function isDeny(r) { return r && r.decision === "deny" && typeof r.reason === "string" && r.reason.length > 0; }
-    check("Allows other tools untouched", function () {
-      var r = preToolUse({ tool: "lookup_order", input: { order_id: "A-1" } }, S(null));
-      return (r && r.decision === "allow") || ("Got " + JSON.stringify(r));
-    });
-    check("Denies a refund before verification and points to get_customer", function () {
-      var r = preToolUse(R(120), S(null));
-      if (!isDeny(r)) return "Expected a deny with a reason; got " + JSON.stringify(r);
-      return /get_customer/.test(r.reason) || "Tell the agent what to do next: mention get_customer in the reason.";
-    });
-    check("Checks verification before the amount (unverified $900 is denied, not escalated)", function () {
-      var r = preToolUse(R(900), S(null));
-      return isDeny(r) || ("Got " + JSON.stringify(r));
-    });
-    check("Denies a refund for a different customer than the verified one", function () {
-      var r = preToolUse(R(120, "C-99"), S("C-88"));
-      return isDeny(r) || ("Got " + JSON.stringify(r));
-    });
-    check("Denies a non-positive or non-numeric amount", function () {
-      var a = preToolUse(R(0), S()), b = preToolUse(R("120"), S()), c = preToolUse(R(-5), S());
-      return (isDeny(a) && isDeny(b) && isDeny(c)) || "Amounts 0, \"120\" (a string) and -5 should all be denied.";
-    });
-    check("Redirects refunds over $500 to escalate_to_human", function () {
-      var r = preToolUse(R(740), S());
-      return (r && r.decision === "redirect" && r.tool === "escalate_to_human" && !!r.reason) || ("Got " + JSON.stringify(r));
-    });
-    check("Allows exactly $500 for the verified customer", function () {
-      var r = preToolUse(R(500), S());
-      return (r && r.decision === "allow") || ("Got " + JSON.stringify(r) + ". The limit is \"over $500\".");
-    });
-  },
+  py: "refund_gate", fn: "pre_tool_use",
   takeaway: "When a rule must hold every time, it belongs in code the model can't skip. The hook also tells the agent what to do next (verify, or escalate) so the conversation recovers." },
 
 { id: "1-4", d: 1, ts: "1.5", type: "code", mins: 15, title: "Normalize at the boundary",
-  summary: "Write a PostToolUse transform that unifies timestamps and status codes from three MCP servers.",
+  summary: "Write a PostToolUse transform in Python that unifies timestamps and status codes from three MCP servers.",
   brief: ["Three MCP servers feed the support agent. The warehouse returns Unix seconds, billing returns Unix milliseconds, the CRM returns ISO 8601 with offsets, and order status arrives as numeric codes. The agent has been comparing 1717171717 with \"2024-05-31T18:08:37+02:00\" and getting the order of events wrong.",
-          "Implement `postToolUse` so every result reaches the model in one format."],
-  spec: ["Any key ending in `_at`: Unix seconds, Unix milliseconds (treat numbers above 1e12 as ms), or an ISO 8601 string → ISO 8601 UTC, e.g. `\"2024-05-31T16:08:37.000Z\"`.",
+          "Implement `post_tool_use` so every result reaches the model in one format."],
+  spec: ["Any key ending in `_at`: Unix seconds, Unix milliseconds (treat numbers above 1e12 as ms), or an ISO 8601 string → ISO 8601 in UTC, e.g. `\"2024-05-31T16:08:37Z\"`.",
          "`status`: codes 1, 2, 3, 4 → `\"pending\"`, `\"shipped\"`, `\"delivered\"`, `\"refunded\"`; any other number → `\"unknown\"`; strings are lowercased.",
-         "Recurse into nested objects and arrays. Leave every other field alone, and don't mutate the input."],
-  fn: "postToolUse",
-  starter: [
-"// Runs after every MCP tool returns, before Claude sees the result.",
-"function postToolUse(toolName, result) {",
-"  return result;",
-"}"].join("\n"),
-  solution: [
-"const STATUS = { 1: \"pending\", 2: \"shipped\", 3: \"delivered\", 4: \"refunded\" };",
-"",
-"function toIso(v) {",
-"  if (typeof v === \"number\") return new Date(v > 1e12 ? v : v * 1000).toISOString();",
-"  if (typeof v === \"string\") {",
-"    const d = new Date(v);",
-"    return isNaN(d) ? v : d.toISOString();",
-"  }",
-"  return v;",
-"}",
-"",
-"function normalize(value, key) {",
-"  if (Array.isArray(value)) return value.map(v => normalize(v));",
-"  if (value && typeof value === \"object\") {",
-"    const out = {};",
-"    for (const k of Object.keys(value)) out[k] = normalize(value[k], k);",
-"    return out;",
-"  }",
-"  if (key && /_at$/.test(key)) return toIso(value);",
-"  if (key === \"status\") {",
-"    if (typeof value === \"number\") return STATUS[value] || \"unknown\";",
-"    if (typeof value === \"string\") return value.toLowerCase();",
-"  }",
-"  return value;",
-"}",
-"",
-"function postToolUse(toolName, result) {",
-"  return normalize(result);",
-"}"].join("\n"),
-  harness: function harness() {
-    var ISO = "2024-05-31T16:08:37.000Z";
-    check("Unix seconds → ISO 8601 UTC", function () {
-      var r = postToolUse("lookup_order", { created_at: 1717171717 });
-      return (r && r.created_at === ISO) || ("created_at = " + JSON.stringify(r && r.created_at));
-    });
-    check("Unix milliseconds → ISO 8601 UTC", function () {
-      var r = postToolUse("billing", { charged_at: 1717171717000 });
-      return (r && r.charged_at === ISO) || ("charged_at = " + JSON.stringify(r && r.charged_at));
-    });
-    check("ISO with an offset → UTC", function () {
-      var r = postToolUse("crm", { updated_at: "2024-05-31T18:08:37+02:00" });
-      return (r && r.updated_at === ISO) || ("updated_at = " + JSON.stringify(r && r.updated_at));
-    });
-    check("Status codes → words, unknown codes → \"unknown\", strings lowercased", function () {
-      var a = postToolUse("x", { status: 2 }), b = postToolUse("x", { status: 9 }), c = postToolUse("x", { status: "DELIVERED" });
-      var ok = a && a.status === "shipped" && b && b.status === "unknown" && c && c.status === "delivered";
-      return ok || ("Got " + JSON.stringify([a && a.status, b && b.status, c && c.status]));
-    });
-    check("Recurses into nested arrays and objects", function () {
-      var r = postToolUse("lookup_order", { orders: [{ status: 3, shipment: { shipped_at: 1717171717 } }] });
-      var o = r && r.orders && r.orders[0];
-      return (o && o.status === "delivered" && o.shipment && o.shipment.shipped_at === ISO) || ("Got " + JSON.stringify(r));
-    });
-    check("Leaves other fields alone and doesn't mutate the input", function () {
-      var input = { order_id: "A-1", amount: 120, note: "created_at was wrong", status: 1, items: [{ sku: "S1" }] };
-      var copy = JSON.stringify(input);
-      var r = postToolUse("lookup_order", input);
-      if (JSON.stringify(input) !== copy) return "The input object was modified.";
-      return (r.order_id === "A-1" && r.amount === 120 && r.note === "created_at was wrong" && r.items[0].sku === "S1") || ("Got " + JSON.stringify(r));
-    });
-  },
+         "Recurse into nested dicts and lists. Leave every other field alone, and don't mutate the input."],
+  py: "normalize", fn: "post_tool_use",
   takeaway: "Normalize once, at the boundary, in code. The model then reasons over one vocabulary, and no prompt instruction has to remember three formats." },
 
 { id: "1-5", d: 1, ts: "1.4", type: "classify", mins: 6, title: "Pack the escalation handoff",
@@ -817,171 +557,25 @@ window.COURSE_LABS = [
   takeaway: "Precision comes from defining what to report, what to skip, and what each severity looks like in code, not from telling the model to be careful." },
 
 { id: "4-3", d: 4, ts: "4.4", type: "code", mins: 15, title: "Retry with error feedback",
-  summary: "Implement a bounded validation-retry loop that knows when retrying is pointless.",
-  brief: ["The extraction pipeline currently calls the model once and passes whatever comes back downstream. Implement `extractWithRetry` so validation errors are fed back to the model, with a hard limit on attempts."],
+  summary: "Implement a bounded validation-retry loop in Python that knows when retrying is pointless.",
+  brief: ["The extraction pipeline currently calls the model once and passes whatever comes back downstream. Implement `extract_with_retry` so validation errors are fed back to the model, with a hard limit on attempts."],
   spec: ["At most 3 model calls.",
          "If the output isn't valid JSON, treat it as a validation failure whose error message says the output was not valid JSON.",
          "On a failure, append the model's previous output as an `assistant` message, then a `user` message quoting the specific error, and call again.",
-         "If `validate` returns `retryable: false`, the information isn't in the document; stop at once.",
-         "Return `{ ok, data, attempts }`, where `attempts` is the number of model calls made."],
-  fn: "extractWithRetry",
-  starter: [
-"// callModel(messages) -> string          (the model's JSON text)",
-"// validate(obj)       -> { ok: true }",
-"//                     or { ok: false, error: \"due_date: expected YYYY-MM-DD\", retryable: true | false }",
-"function extractWithRetry(callModel, docText, validate) {",
-"  const messages = [{ role: \"user\", content: \"Extract the invoice fields as JSON.\\n\\n\" + docText }];",
-"  const raw = callModel(messages);",
-"  const data = JSON.parse(raw);",
-"  return { ok: validate(data).ok, data: data, attempts: 1 };",
-"}"].join("\n"),
-  solution: [
-"function extractWithRetry(callModel, docText, validate) {",
-"  const messages = [{ role: \"user\", content: \"Extract the invoice fields as JSON.\\n\\n\" + docText }];",
-"  let last = null;",
-"",
-"  for (let attempt = 1; attempt <= 3; attempt++) {",
-"    const raw = callModel(messages);",
-"    let data = null, verdict;",
-"    try {",
-"      data = JSON.parse(raw);",
-"      verdict = validate(data);",
-"    } catch (e) {",
-"      verdict = { ok: false, error: \"Output was not valid JSON: \" + e.message, retryable: true };",
-"    }",
-"    if (verdict.ok) return { ok: true, data: data, attempts: attempt };",
-"",
-"    last = { ok: false, data: data, attempts: attempt, error: verdict.error };",
-"    if (verdict.retryable === false) return last;   // the source lacks it; retrying can't help",
-"",
-"    messages.push({ role: \"assistant\", content: raw });",
-"    messages.push({ role: \"user\", content: \"That output failed validation: \" + verdict.error +",
-"                                          \". Return corrected JSON only.\" });",
-"  }",
-"  return last;",
-"}"].join("\n"),
-  harness: function harness() {
-    function model(outputs) {
-      var m = { calls: 0, seen: [] };
-      m.fn = function (messages) {
-        m.seen.push(JSON.parse(JSON.stringify(messages)));
-        m.calls++;
-        if (m.calls > 6) throw new Error("MOCK_BUDGET: called the model more than 6 times");
-        return outputs[Math.min(m.calls, outputs.length) - 1];
-      };
-      return m;
-    }
-    function v(obj) {
-      if (obj.due_date === undefined) return { ok: false, error: "due_date: missing", retryable: true };
-      if (obj.due_date === "ABSENT") return { ok: false, error: "po_number: not present in document", retryable: false };
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(obj.due_date)) return { ok: false, error: "due_date: expected YYYY-MM-DD", retryable: true };
-      return { ok: true };
-    }
-    var good = "{\"due_date\":\"2024-06-30\"}", bad = "{\"due_date\":\"30/06/24\"}";
-    check("Succeeds on the first try without extra calls", function () {
-      var m = model([good]); var r = extractWithRetry(m.fn, "INV-1", v);
-      return (r && r.ok === true && r.attempts === 1 && m.calls === 1) || ("Got " + JSON.stringify(r) + " after " + m.calls + " call(s).");
-    });
-    check("Feeds the specific error back, after the previous output", function () {
-      var m = model([bad, good]); var r = extractWithRetry(m.fn, "INV-2", v);
-      if (!(r && r.ok === true && r.attempts === 2)) return "Expected ok after 2 attempts; got " + JSON.stringify(r);
-      var msgs = m.seen[1], u = msgs[msgs.length - 1], a = msgs[msgs.length - 2];
-      if (!a || a.role !== "assistant" || a.content !== bad) return "The second call should include the previous output as an assistant message.";
-      return (u.role === "user" && u.content.indexOf("expected YYYY-MM-DD") >= 0) || "The last user message should quote the validation error.";
-    });
-    check("Treats unparseable output as a retryable failure", function () {
-      var m = model(["Sure! Here is the JSON: {due_date: 2024-06-30}", good]); var r = extractWithRetry(m.fn, "INV-3", v);
-      if (!(r && r.ok === true && r.attempts === 2)) return "Expected recovery on attempt 2; got " + JSON.stringify(r);
-      var u = m.seen[1][m.seen[1].length - 1];
-      return /JSON/.test(u.content) || "Tell the model its output was not valid JSON.";
-    });
-    check("Gives up after 3 attempts", function () {
-      var m = model([bad, bad, bad, bad, bad]); var r = extractWithRetry(m.fn, "INV-4", v);
-      return (r && r.ok === false && r.attempts === 3 && m.calls === 3) || ("Got " + JSON.stringify(r) + " after " + m.calls + " call(s).");
-    });
-    check("Stops immediately when the information isn't in the document", function () {
-      var m = model(["{\"due_date\":\"ABSENT\"}", good]); var r = extractWithRetry(m.fn, "INV-5", v);
-      return (r && r.ok === false && m.calls === 1) || ("Made " + m.calls + " call(s); retrying can't add information the source lacks.");
-    });
-    check("Keeps the original document message first on every call", function () {
-      var m = model([bad, bad, good]); extractWithRetry(m.fn, "INV-6 body", v);
-      var allOk = m.seen.every(function (s) { return s[0] && s[0].role === "user" && String(s[0].content).indexOf("INV-6 body") >= 0; });
-      return allOk || "Every call should start with the original user message containing the document.";
-    });
-  },
+         "If `validate` returns `\"retryable\": False`, the information isn't in the document; stop at once.",
+         "Return `{\"ok\", \"data\", \"attempts\"}`, where `attempts` is the number of model calls made."],
+  py: "retry_extract", fn: "extract_with_retry",
   takeaway: "Retry with the error, not the same prompt; bound the attempts; and recognise the failures no retry can fix." },
 
 { id: "4-4", d: 4, ts: "4.5", type: "code", mins: 12, title: "Reconcile a message batch",
-  summary: "Match out-of-order batch results by custom_id and decide what to resubmit.",
+  summary: "Match out-of-order batch results by custom_id in Python and decide what to resubmit.",
   brief: ["The nightly extraction batch's results came back. The current code assumes results arrive in input order and that everything succeeded. Rewrite `reconcile`."],
   spec: ["Results arrive in any order, and a result may be missing entirely.",
          "`texts`: `custom_id` → text of the first content block, for succeeded results only.",
          "`resubmit`: expired, canceled, `api_error` or `overloaded_error` results, plus inputs with no result at all.",
-         "`needsFix`: `invalid_request_error` results; resubmitting them unchanged would fail again.",
-         "Sort `resubmit` and `needsFix` alphabetically."],
-  fn: "reconcile",
-  starter: [
-"// inputs : [{ custom_id: \"doc-0001\", params: {...} }, ...]",
-"// results: [{ custom_id, result: { type: \"succeeded\", message: { content: [{ type: \"text\", text }] } } }",
-"//          | { custom_id, result: { type: \"errored\", error: { type: \"invalid_request_error\" | \"api_error\" | \"overloaded_error\" } } }",
-"//          | { custom_id, result: { type: \"expired\" } }",
-"//          | { custom_id, result: { type: \"canceled\" } }]",
-"// Return { texts: { [custom_id]: text }, resubmit: [custom_id, ...], needsFix: [custom_id, ...] }",
-"function reconcile(inputs, results) {",
-"  const texts = {};",
-"  for (let i = 0; i < inputs.length; i++) {",
-"    texts[inputs[i].custom_id] = results[i].result.message.content[0].text;",
-"  }",
-"  return { texts: texts, resubmit: [], needsFix: [] };",
-"}"].join("\n"),
-  solution: [
-"function reconcile(inputs, results) {",
-"  const byId = {};",
-"  for (const r of results) byId[r.custom_id] = r.result;",
-"",
-"  const texts = {}, resubmit = [], needsFix = [];",
-"  for (const input of inputs) {",
-"    const id = input.custom_id, res = byId[id];",
-"    if (!res) { resubmit.push(id); continue; }",
-"    if (res.type === \"succeeded\") { texts[id] = res.message.content[0].text; continue; }",
-"    if (res.type === \"errored\" && res.error && res.error.type === \"invalid_request_error\") {",
-"      needsFix.push(id); continue;",
-"    }",
-"    resubmit.push(id);  // expired, canceled, api_error, overloaded_error",
-"  }",
-"  return { texts: texts, resubmit: resubmit.sort(), needsFix: needsFix.sort() };",
-"}"].join("\n"),
-  harness: function harness() {
-    function ok(id, t) { return { custom_id: id, result: { type: "succeeded", message: { content: [{ type: "text", text: t }] } } }; }
-    function er(id, t) { return { custom_id: id, result: { type: "errored", error: { type: t } } }; }
-    function ex(id) { return { custom_id: id, result: { type: "expired" } }; }
-    function cn(id) { return { custom_id: id, result: { type: "canceled" } }; }
-    var ids = ["doc-01", "doc-02", "doc-03", "doc-04", "doc-05", "doc-06", "doc-07"];
-    var inputs = ids.map(function (id) { return { custom_id: id, params: {} }; });
-    var results = [er("doc-05", "invalid_request_error"), ok("doc-03", "C"), ex("doc-02"), ok("doc-01", "A"), er("doc-06", "overloaded_error"), cn("doc-07")];
-    function run() { return reconcile(inputs, JSON.parse(JSON.stringify(results))); }
-    check("Matches results by custom_id, not position", function () {
-      var r = run(); return (r && r.texts && r.texts["doc-01"] === "A" && r.texts["doc-03"] === "C") || ("texts = " + JSON.stringify(r && r.texts));
-    });
-    check("Only succeeded results appear in texts", function () {
-      var r = run(); var keys = Object.keys((r && r.texts) || {}).sort();
-      return JSON.stringify(keys) === JSON.stringify(["doc-01", "doc-03"]) || ("texts has keys " + JSON.stringify(keys));
-    });
-    check("Resubmits expired, canceled and overloaded results", function () {
-      var r = run(); var s = (r && r.resubmit) || [];
-      return (s.indexOf("doc-02") >= 0 && s.indexOf("doc-06") >= 0 && s.indexOf("doc-07") >= 0) || ("resubmit = " + JSON.stringify(s));
-    });
-    check("Resubmits inputs whose result never arrived", function () {
-      var r = run(); return ((r && r.resubmit) || []).indexOf("doc-04") >= 0 || ("doc-04 has no result and should be resubmitted; resubmit = " + JSON.stringify(r && r.resubmit));
-    });
-    check("Sends invalid requests to needsFix, not resubmit", function () {
-      var r = run(); var n = (r && r.needsFix) || [], s = (r && r.resubmit) || [];
-      return (n.length === 1 && n[0] === "doc-05" && s.indexOf("doc-05") < 0) || ("needsFix = " + JSON.stringify(n));
-    });
-    check("Returns sorted lists", function () {
-      var r = run(); return JSON.stringify(r && r.resubmit) === JSON.stringify(["doc-02", "doc-04", "doc-06", "doc-07"]) || ("resubmit = " + JSON.stringify(r && r.resubmit));
-    });
-  },
+         "`needs_fix`: `invalid_request_error` results; resubmitting them unchanged would fail again.",
+         "Sort `resubmit` and `needs_fix`."],
+  py: "batch_reconcile", fn: "reconcile",
   takeaway: "Key everything by `custom_id`, assume nothing about order or completeness, and resubmit only what can succeed unchanged." },
 
 { id: "4-5", d: 4, ts: "4.5", type: "classify", mins: 5, title: "Batch or synchronous?",
